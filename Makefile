@@ -1,4 +1,4 @@
-.PHONY: test checkstyle test-convergence all
+.PHONY: test checkstyle test-convergence all serve build clean
 
 
 all: checkstyle test test-convergence
@@ -7,13 +7,11 @@ all: checkstyle test test-convergence
 test:
 	python -m pytest --disable-warnings test/ --ignore=test/convergence
 
-# Command to run flake8 (code style check), isort (import ordering), and black (code formatting)
-# Subsequent commands still run if the previous fails, but return failure at the end
+# Command to run ruff for linting and formatting code
 checkstyle:
-	flake8 .; flake8_status=$$?; \
-	isort .; isort_status=$$?; \
-	black .; black_status=$$?; \
-	if [ $$flake8_status -ne 0 ] || [ $$isort_status -ne 0 ] || [ $$black_status -ne 0 ]; then \
+	ruff check . --fix; ruff_check_status=$$?; \
+	ruff format .; ruff_format_status=$$?; \
+	if [ $$ruff_check_status -ne 0 ] || [ $$ruff_format_status -ne 0 ]; then \
 		exit 1; \
 	fi
 
@@ -40,3 +38,17 @@ run-benchmarks:
 			python $$script; \
 		fi; \
 	done
+
+# MkDocs Configuration
+MKDOCS = mkdocs
+CONFIG_FILE = mkdocs.yml
+
+# MkDocs targets
+serve:
+	$(MKDOCS) serve -f $(CONFIG_FILE)
+
+build:
+	$(MKDOCS) build -f $(CONFIG_FILE)
+
+clean:
+	rm -rf site/

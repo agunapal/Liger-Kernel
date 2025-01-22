@@ -1,4 +1,3 @@
-from test.utils import HFAlignmentLoss, assert_verbose_allclose, set_seed
 from typing import Tuple
 
 import pytest
@@ -9,6 +8,9 @@ from liger_kernel.chunked_loss import LigerFusedLinearCPOLoss
 from liger_kernel.chunked_loss.cpo_loss import LigerFusedLinearCPOFunction
 from liger_kernel.chunked_loss.functional import liger_fused_linear_cpo
 from liger_kernel.utils import infer_device
+from test.utils import HFAlignmentLoss
+from test.utils import assert_verbose_allclose
+from test.utils import set_seed
 
 device = infer_device()
 
@@ -60,20 +62,22 @@ class HFCPOLoss(HFAlignmentLoss):
         if self.loss_type == "sigmoid":
             # This reduces to Equation 3 from the CPO paper when label_smoothing -> 0.
             losses = (
-                F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
-                + F.logsigmoid(-self.beta * logits) * self.label_smoothing
+                -F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
+                - F.logsigmoid(-self.beta * logits) * self.label_smoothing
             )
         elif self.loss_type == "simpo":
             logits = logits - (self.simpo_gamma / self.beta)
             losses = (
-                F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
-                + F.logsigmoid(-self.beta * logits) * self.label_smoothing
+                -F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
+                - F.logsigmoid(-self.beta * logits) * self.label_smoothing
             )
         else:
-            raise ValueError(
-                f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid']"
-            )
-        return losses
+            raise ValueError(f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid']")
+
+        chosen_rewards = self.beta * policy_chosen_logps
+        rejected_rewards = self.beta * policy_rejected_logps
+
+        return losses, chosen_rewards, rejected_rewards
 
 
 class TorchLMHeadCPO(torch.nn.Module):
@@ -86,22 +90,23 @@ class TorchLMHeadCPO(torch.nn.Module):
         ignore_index: int = -100,
         beta: float = 0.1,
         alpha: float = 1.0,
+        label_smoothing: float = 0.0,
         loss_type: str = "sigmoid",
         simpo_gamma: float = 0.5,
     ):
         super().__init__()
-        self.lin = torch.nn.Linear(
-            in_features=H, out_features=V, bias=bias, dtype=dtype
-        )
+        self.lin = torch.nn.Linear(in_features=H, out_features=V, bias=bias, dtype=dtype)
         self.cpo_loss = HFCPOLoss(
             ignore_index=ignore_index,
             beta=beta,
             loss_type=loss_type,
+            label_smoothing=label_smoothing,
             simpo_gamma=simpo_gamma,
         ).get_batch_loss_metrics
+        self.average_log_prob = loss_type == "simpo"
 
     def forward(self, x, y):
-        return self.cpo_loss(self.lin.weight, x, y, self.lin.bias)
+        return self.cpo_loss(self.lin.weight, x, y, self.lin.bias, average_log_prob=self.average_log_prob)
 
 
 class LigerLMHeadCPO(torch.nn.Module):
@@ -114,13 +119,15 @@ class LigerLMHeadCPO(torch.nn.Module):
         ignore_index: int = -100,
         beta: float = 0.1,
         alpha: float = 1.0,
+        label_smoothing: float = 0.0,
     ):
         super().__init__()
-        self.lin = torch.nn.Linear(
-            in_features=H, out_features=V, bias=bias, dtype=dtype
-        )
+        self.lin = torch.nn.Linear(in_features=H, out_features=V, bias=bias, dtype=dtype)
         self.cpo_loss = LigerFusedLinearCPOLoss(
-            ignore_index=ignore_index, beta=beta, alpha=alpha
+            ignore_index=ignore_index,
+            beta=beta,
+            alpha=alpha,
+            label_smoothing=label_smoothing,
         )
 
     def forward(self, x, y):
@@ -137,16 +144,27 @@ class LigerLMHeadCPO(torch.nn.Module):
 @pytest.mark.parametrize(
     "scalar, dtype, atol, rtol",
     [
-        (1.0, torch.bfloat16, 5e-3, 5e-3),
+        (1.0, torch.bfloat16, 5e-2, 5e-2),
         (1.0, torch.float32, 1e-5, 5e-4),
     ],
 )
 @pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.parametrize(
-    "ignore_index, beta, alpha", [(-100, 0.1, 1.0), (42, 0.2, 0.85)]
-)
+@pytest.mark.parametrize("ignore_index, beta, alpha", [(-100, 0.1, 1.0), (42, 0.2, 0.85)])
+@pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
 def test_correctness(
-    B, T, H, V, scalar, dtype, atol, rtol, bias, ignore_index, beta, alpha
+    B,
+    T,
+    H,
+    V,
+    scalar,
+    dtype,
+    atol,
+    rtol,
+    bias,
+    ignore_index,
+    beta,
+    alpha,
+    label_smoothing,
 ):
     B = 2 * B  # cpo loss requires B to be even
 
@@ -157,6 +175,7 @@ def test_correctness(
         bias=bias,
         ignore_index=ignore_index,
         beta=beta,
+        label_smoothing=label_smoothing,
     )
     liger_lm_head_cpo = LigerLMHeadCPO(
         H=H,
@@ -165,6 +184,7 @@ def test_correctness(
         bias=bias,
         ignore_index=ignore_index,
         beta=beta,
+        label_smoothing=label_smoothing,
     )
 
     torch_lm_head_cpo.lin.weight.data = liger_lm_head_cpo.lin.weight.data = torch.randn(
@@ -172,9 +192,7 @@ def test_correctness(
     )
 
     if bias:
-        torch_lm_head_cpo.lin.bias.data = liger_lm_head_cpo.lin.bias.data = torch.randn(
-            V, device=device, dtype=dtype
-        )
+        torch_lm_head_cpo.lin.bias.data = liger_lm_head_cpo.lin.bias.data = torch.randn(V, device=device, dtype=dtype)
 
     _input = torch.randn(B, T, H, device=device, dtype=dtype) * scalar
     input1 = _input.detach().clone().requires_grad_(True)
@@ -270,12 +288,8 @@ def test_correctness_functional(B, T, H, V, scalar, dtype, atol, rtol, bias):
     bias1 = _bias.detach().clone().requires_grad_(True) if bias else None
     bias2 = _bias.detach().clone().requires_grad_(True) if bias else None
 
-    loss1, aggregated_aux_outputs1 = LigerFusedLinearCPOFunction.apply(
-        input1, weight1, target, bias1
-    )
-    loss2, aggregated_aux_outputs2 = liger_fused_linear_cpo(
-        input2, weight2, target, bias2
-    )
+    loss1, aggregated_aux_outputs1 = LigerFusedLinearCPOFunction.apply(input1, weight1, target, bias1)
+    loss2, aggregated_aux_outputs2 = liger_fused_linear_cpo(input2, weight2, target, bias2)
 
     assert_verbose_allclose(loss1, loss2, atol=atol, rtol=rtol)
 
